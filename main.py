@@ -27,7 +27,7 @@ model.fuse()
 
 # ---------- Webcam ----------
 try:
-    cam = cv2.VideoCapture(0)
+    cam = cv2.VideoCapture(1)
     if not cam.isOpened():
         cam = None
         logging.warning("⚠️ Không mở được webcam (chưa cắm hoặc không hỗ trợ)")
