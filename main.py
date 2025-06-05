@@ -37,11 +37,16 @@ except:
 
 
 # ---------- FastAPI ----------
-app = FastAPI(title="SmartWaste-Detector")
+app = FastAPI(
+    title="SmartWaste-Detector",
+    docs_url="/docs",      # đảm bảo luôn có
+    redoc_url=None
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],     
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------- Thư mục debug ----------
@@ -108,3 +113,8 @@ async def detect(file: UploadFile = File(...), conf: float = 0.25):
 
 #     logging.info("Snapshot %-12s %4.1f ms  ⇒ %s", lbl, ms, grp)
 #     return {"group": grp, "label": lbl, "conf": round(sc,3), "time_ms": round(ms,1)}
+
+# Thêm route gốc để không bị 404 HEAD /
+@app.get("/")
+def root():
+    return {"message": "SmartWaste AI server is running"}
