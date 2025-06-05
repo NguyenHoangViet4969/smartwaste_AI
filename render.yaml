@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: smartwaste-ai-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
+    envVars:
+      - key: PORT
+        value: 8000

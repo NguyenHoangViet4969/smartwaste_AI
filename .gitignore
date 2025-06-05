@@ -1,0 +1,29 @@
+# 💻 Môi trường ảo (virtualenv)
+env/
+venv/
+.yolo_env/
+yolo_env/
+*.egg-info/
+
+# 🐍 Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 📁 Ảnh debug / xuất kết quả
+debug/
+
+# 📦 File mô hình lớn (nếu không muốn đẩy lên GitHub)
+weights/*.pt
+weights/*.onnx
+
+# 🛠 VS Code settings
+.vscode/
+
+# 🧹 Hệ điều hành tạo
+.DS_Store
+Thumbs.db
+
+# 🔒 File key (nếu dùng Firebase)
+serviceAccountKey.json

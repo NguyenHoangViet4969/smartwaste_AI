@@ -1,0 +1,6 @@
+{
+  "chemical_container": "N",
+  "food_waste": "O",
+  "paper_box": "R",
+  "plastic_bottle": "R"
+}
