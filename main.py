@@ -26,9 +26,15 @@ model.fuse()
 # })
 
 # ---------- Webcam ----------
-cam = cv2.VideoCapture(1)
-if not cam.isOpened():
-    raise RuntimeError("❌ Không mở được webcam")
+try:
+    cam = cv2.VideoCapture(0)
+    if not cam.isOpened():
+        cam = None
+        logging.warning("⚠️ Không mở được webcam (chưa cắm hoặc không hỗ trợ)")
+except:
+    cam = None
+    logging.warning("⚠️ Không thể khởi tạo webcam (lỗi thư viện hoặc thiết bị)")
+
 
 # ---------- FastAPI ----------
 app = FastAPI(title="SmartWaste-Detector")
