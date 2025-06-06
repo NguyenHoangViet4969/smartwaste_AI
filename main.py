@@ -75,7 +75,7 @@ async def detect(file: UploadFile = File(...), conf: float = 0.25):
     if dets:
         best = max(dets, key=lambda d: d['conf'])
         group = best['group']
-        db.reference("/smartwaste/current").set(group)
+        db.reference("/waste/ai").set(group)  # ✅ gửi đúng node /waste/ai
         logging.info("🔥 Gửi group lên Firebase: %s", group)
 
     vis = r.plot()
@@ -109,9 +109,8 @@ def snapshot(conf: float = 0.25):
         grp = GROUP.get(lbl, "N")
         conf_score = float(r.boxes.conf[idx])
 
-    # 🔥 Gửi kết quả lên Firebase
-    db.reference("/smartwaste/current").set(grp)
-    db.reference("/smartwaste/trigger").set(False)
+    # 🔥 Gửi kết quả lên Firebase → đúng vào /waste/ai
+    db.reference("/waste/ai").set(grp)
 
     vis = r.plot()
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
