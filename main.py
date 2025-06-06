@@ -83,7 +83,7 @@ async def detect(file: UploadFile = File(...), conf: float = 0.25):
 
     vis = r.plot()
     ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    cv2.imwrite(str(DEBUG_DIR / f"{ts}_{file.filename}"), vis)
+    cv2.imwrite(str(DEBUG_DIR / f"{ts}_{file.filename}.jpg"), vis)
 
     return {"detections": dets}
 
