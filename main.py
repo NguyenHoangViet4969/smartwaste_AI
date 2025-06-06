@@ -4,9 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 import numpy as np, cv2, json, pathlib, time, logging
 from datetime import datetime
-
-# import firebase_admin                                 # ★ new
-# from firebase_admin import credentials, db           # ★
+import firebase_admin
+from firebase_admin import credentials, db
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -19,11 +18,11 @@ GROUP  = json.load(open(BASE / "mapping.json"))
 model  = YOLO(BASE / "weights" / "best.pt")
 model.fuse()
 
-# # ---------- Firebase ----------
-# cred = credentials.Certificate(BASE / "serviceAccountKey.json")  # tải từ console
-# firebase_admin.initialize_app(cred, {
-#     "databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"
-# })
+# ---------- Firebase ----------
+cred = credentials.Certificate(BASE / "serviceAccountKey.json")  # 🔐
+firebase_admin.initialize_app(cred, {
+    "databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"
+})
 
 # ---------- Webcam ----------
 try:
@@ -35,16 +34,15 @@ except:
     cam = None
     logging.warning("⚠️ Không thể khởi tạo webcam (lỗi thư viện hoặc thiết bị)")
 
-
 # ---------- FastAPI ----------
 app = FastAPI(
     title="SmartWaste-Detector",
-    docs_url="/docs",      # đảm bảo luôn có
+    docs_url="/docs",
     redoc_url=None
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -53,7 +51,7 @@ app.add_middleware(
 DEBUG_DIR = BASE / "debug"
 DEBUG_DIR.mkdir(exist_ok=True)
 
-# ================= 2. endpoint /detect (giữ nguyên) =================
+# ================= 2. endpoint /detect =================
 @app.post("/detect")
 async def detect(file: UploadFile = File(...), conf: float = 0.25):
     img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8),
@@ -73,6 +71,13 @@ async def detect(file: UploadFile = File(...), conf: float = 0.25):
             "box"  : [round(x, 2) for x in box.cpu().tolist()]
         })
 
+    # 🔥 Gửi group lên Firebase nếu có
+    if dets:
+        best = max(dets, key=lambda d: d['conf'])
+        group = best['group']
+        db.reference("/smartwaste/current").set(group)
+        logging.info("🔥 Gửi group lên Firebase: %s", group)
+
     vis = r.plot()
     ts  = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
     cv2.imwrite(str(DEBUG_DIR / f"{ts}_{file.filename}"), vis)
@@ -82,39 +87,40 @@ async def detect(file: UploadFile = File(...), conf: float = 0.25):
 
     return {"detections": dets}
 
-# ================= 3. endpoint /snapshot (mới, cho ESP) ==============
-# @app.get("/snapshot")
-# def snapshot(conf: float = 0.25):
-#     ok, frame = cam.read()
-#     if not ok:
-#         return {"error": "camera"}
+# ================= 3. endpoint /snapshot (cho ESP) =================
+@app.get("/snapshot")
+def snapshot(conf: float = 0.25):
+    if cam is None:
+        return {"error": "camera_not_available"}
 
-#     t0 = time.perf_counter()
-#     r  = model(frame, conf=conf, verbose=False)[0]
-#     ms = (time.perf_counter() - t0) * 1000
+    ok, frame = cam.read()
+    if not ok:
+        return {"error": "camera_read_failed"}
 
-#     if not len(r.boxes):
-#         grp, lbl, sc = "N", "unknown", 0
-#     else:
-#         idx = int(r.boxes.conf.argmax())
-#         lbl = CLS[int(r.boxes.cls[idx])]
-#         grp = GROUP.get(lbl, "N")
-#         sc  = float(r.boxes.conf[idx])
+    t0 = time.perf_counter()
+    r  = model(frame, conf=conf, verbose=False)[0]
+    infer_ms = (time.perf_counter() - t0) * 1000
 
-#     # 🔥 ghi kết quả lên Firebase
-#     db.reference("/smartwaste/current").set(grp)
-#     # (nếu ESP đặt trigger) → reset
-#     db.reference("/smartwaste/trigger").set(False)
+    if not len(r.boxes):
+        grp, lbl, conf_score = "N", "unknown", 0
+    else:
+        idx = int(r.boxes.conf.argmax())
+        lbl = CLS[int(r.boxes.cls[idx])]
+        grp = GROUP.get(lbl, "N")
+        conf_score = float(r.boxes.conf[idx])
 
-#     # Lưu ảnh debug
-#     vis = r.plot()
-#     ts  = datetime.now().strftime('%Y%m%d_%H%M%S')
-#     cv2.imwrite(str(DEBUG_DIR / f"{ts}_snapshot.jpg"), vis)
+    # 🔥 Gửi kết quả lên Firebase
+    db.reference("/smartwaste/current").set(grp)
+    db.reference("/smartwaste/trigger").set(False)
 
-#     logging.info("Snapshot %-12s %4.1f ms  ⇒ %s", lbl, ms, grp)
-#     return {"group": grp, "label": lbl, "conf": round(sc,3), "time_ms": round(ms,1)}
+    vis = r.plot()
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    cv2.imwrite(str(DEBUG_DIR / f"{ts}_snapshot.jpg"), vis)
 
-# Thêm route gốc để không bị 404 HEAD /
+    logging.info("Snapshot %-12s %4.1f ms  ⇒ %s", lbl, infer_ms, grp)
+    return {"group": grp, "label": lbl, "conf": round(conf_score,3), "time_ms": round(infer_ms,1)}
+
+# ================= Root =================
 @app.get("/")
 def root():
     return {"message": "SmartWaste AI server is running"}
