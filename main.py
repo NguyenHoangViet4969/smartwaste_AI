@@ -7,6 +7,7 @@ FastAPI YOLO + Firebase trigger
 import os, time, cv2, json, logging, base64
 from datetime import datetime
 from pathlib import Path
+from io import StringIO
 
 import numpy as np, httpx
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks
@@ -16,7 +17,6 @@ from ultralytics import YOLO
 
 import firebase_admin
 from firebase_admin import credentials, db as fdb
-
 
 
 # ─── Config ───────────────────────────────────────────
