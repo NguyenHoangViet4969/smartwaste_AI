@@ -12,18 +12,10 @@ __pycache__/
 *.pyd
 
 # 📁 Ảnh debug / xuất kết quả
-debug/
-
-# 📦 File mô hình lớn (nếu không muốn đẩy lên GitHub)
-weights/*.pt
-weights/*.onnx
+snapshots/
 
 # 🛠 VS Code settings
 .vscode/
 
-# 🧹 Hệ điều hành tạo
-.DS_Store
-Thumbs.db
-
 # 🔒 File key (nếu dùng Firebase)
-serviceAccountKey.json
+firebase_key.json

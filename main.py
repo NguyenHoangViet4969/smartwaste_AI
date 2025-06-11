@@ -1,124 +1,121 @@
-# ================= 1. import / cấu hình =================
-from fastapi import FastAPI, File, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-import numpy as np, cv2, json, pathlib, time, logging, os
+"""
+FastAPI YOLO + Firebase trigger
+  • POST /detect   : upload image
+  • GET  /snapshot : pull image from ESP32-CAM
+    → Sau mỗi infer ➜ /waste/ai = true và /waste/group = loại rác
+"""
+import os, time, cv2, json, logging, base64
 from datetime import datetime
+from pathlib import Path
+
+import numpy as np, httpx
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
+from ultralytics import YOLO
+
 import firebase_admin
-from firebase_admin import credentials, db
+from firebase_admin import credentials, db as fdb
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+# ─── Config ───────────────────────────────────────────
+ROOT        = Path(__file__).parent
+MODEL_PATH  = ROOT / "weights" / "best.pt"
+ESP_CAM_URL = "http://192.168.118.187/capture"
+DEBUG_DIR   = ROOT / "snapshots"; DEBUG_DIR.mkdir(exist_ok=True)
+CONF_DEF    = 0.25
 
-BASE = pathlib.Path(__file__).parent
-CLS = json.load(open(BASE / "classes.json"))
-GROUP = json.load(open(BASE / "mapping.json"))
+# ─── Class & Mapping ─────────────────────────────────
+CLASSES    = json.loads((ROOT / "classes.json").read_text())
+MAPPING    = json.loads((ROOT / "mapping.json").read_text())  # name -> R/O/N
+GROUP_TXT  = {"R": "Tái chế", "O": "Hữu cơ", "N": "Không tái chế"}
 
-# ---------- YOLO ----------
-model = YOLO(BASE / "weights" / "best.pt")
-model.fuse()
-
-# ---------- Firebase từ Secret File ----------
-firebase_key_path = "/etc/secrets/firebase_key.json"
-with open(firebase_key_path, "r") as f:
-    firebase_key_data = json.load(f)
-
-cred = credentials.Certificate(firebase_key_data)
-firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"
-})
-
-# ---------- Webcam ----------
-try:
-    cam = cv2.VideoCapture(1)
-    if not cam.isOpened():
-        cam = None
-        logging.warning("⚠️ Không mở được webcam (chưa cắm hoặc không hỗ trợ)")
-except:
-    cam = None
-    logging.warning("⚠️ Không thể khởi tạo webcam")
-
-# ---------- FastAPI ----------
-app = FastAPI(
-    title="SmartWaste-Detector",
-    docs_url="/docs",
-    redoc_url=None
+# ─── Firebase Init ───────────────────────────────────
+cred = credentials.Certificate(ROOT / "firebase_key.json")
+firebase_admin.initialize_app(
+    cred, {"databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"}
 )
+
+def push_trigger(info: dict) -> None:
+    fdb.reference("/waste").update({
+        "ai": True,
+        "group": info["group"]
+    })
+
+# ─── Load YOLO model ─────────────────────────────────
+model = YOLO(str(MODEL_PATH))
+if bool(int(os.getenv("FUSE", 1))):
+    model.fuse()
+
+# ─── FastAPI App ─────────────────────────────────────
+app = FastAPI(title="SmartWaste AI")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+log = logging.getLogger("uvicorn.error")
 
-# ---------- Thư mục debug ----------
-DEBUG_DIR = BASE / "debug"
-DEBUG_DIR.mkdir(exist_ok=True)
+# ─── Helpers ─────────────────────────────────────────
+def save_dbg(img: np.ndarray, tag: str) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    cv2.imwrite(str(DEBUG_DIR / f"{ts}_{tag}.jpg"), img)
 
-# ================= 2. /detect =================
+def infer(img: np.ndarray, conf: float = CONF_DEF):
+    res = model(img, conf=conf, verbose=False)[0]
+    if not len(res.boxes):
+        return res.plot(), None
+
+    b       = res.boxes[0]
+    idx     = int(b.cls[0])
+    label   = CLASSES[idx]
+    code    = MAPPING.get(label, "N")
+    group   = GROUP_TXT[code]
+    score   = float(b.conf[0])
+    info = {"label": label, "code": code, "group": group, "conf": score}
+    return res.plot(), info
+
+# ─── Endpoints ───────────────────────────────────────
 @app.post("/detect")
-async def detect(file: UploadFile = File(...), conf: float = 0.25):
-    img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8),
-                       cv2.IMREAD_COLOR)
+async def detect(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    conf: float = CONF_DEF,
+):
+    raw = await file.read()
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    vis, info = await run_in_threadpool(infer, img, conf)
+    if info is None:
+        return {"error": "no_object"}
 
-    t0 = time.perf_counter()
-    r = model(img, conf=conf, verbose=False)[0]
-    infer_ms = (time.perf_counter() - t0) * 1000
+    _, buffer = cv2.imencode(".jpg", vis)
+    img_b64 = base64.b64encode(buffer).decode()
 
-    dets = []
-    for box, score, cls_id in zip(r.boxes.xyxy, r.boxes.conf, r.boxes.cls):
-        lbl = CLS[int(cls_id)]
-        dets.append({
-            "label": lbl,
-            "group": GROUP.get(lbl, "N"),
-            "conf": round(float(score), 4),
-            "box": [round(x, 2) for x in box.cpu().tolist()]
-        })
+    # background_tasks.add_task(save_dbg, vis, "upload")
+    background_tasks.add_task(push_trigger, info)
 
-    if dets:
-        best = max(dets, key=lambda d: d['conf'])
-        group = best['group']
-        db.reference("/waste/ai").set(group)
-        logging.info("🔥 /detect gửi group: %s", group)
+    return {**info, "image": img_b64}
 
-    vis = r.plot()
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    cv2.imwrite(str(DEBUG_DIR / f"{ts}_{file.filename}.jpg"), vis)
-
-    return {"detections": dets}
-
-# ================= 3. /snapshot (cho ESP hoặc kiểm thử) =================
 @app.get("/snapshot")
-def snapshot(conf: float = 0.25):
-    if cam is None:
-        return {"error": "camera_not_available"}
+async def snapshot(
+    background_tasks: BackgroundTasks,
+    conf: float = CONF_DEF,
+):
+    print("📸 snapshot endpoint triggered")
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            r = await client.get(ESP_CAM_URL)
+            r.raise_for_status()
+    except httpx.RequestError as e:
+        log.error("🚫 ESP32-CAM unreachable: %s", e)
+        return {"error": "esp_cam_unreachable"}
 
-    ok, frame = cam.read()
-    if not ok:
-        return {"error": "camera_read_failed"}
+    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+    vis, info = await run_in_threadpool(infer, img, conf)
+    if info is None:
+        return {"error": "no_object"}
 
-    t0 = time.perf_counter()
-    r = model(frame, conf=conf, verbose=False)[0]
-    infer_ms = (time.perf_counter() - t0) * 1000
+    _, buffer = cv2.imencode(".jpg", vis)
+    img_b64 = base64.b64encode(buffer).decode()
 
-    if not len(r.boxes):
-        grp, lbl, conf_score = "N", "unknown", 0
-    else:
-        idx = int(r.boxes.conf.argmax())
-        lbl = CLS[int(r.boxes.cls[idx])]
-        grp = GROUP.get(lbl, "N")
-        conf_score = float(r.boxes.conf[idx])
+    # background_tasks.add_task(save_dbg, vis, "snapshot")
+    background_tasks.add_task(push_trigger, info)
 
-    db.reference("/waste/ai").set(grp)
-    logging.info("📸 /snapshot gửi group: %s", grp)
-
-    vis = r.plot()
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    cv2.imwrite(str(DEBUG_DIR / f"{ts}_snapshot.jpg"), vis)
-
-    return {"group": grp, "label": lbl, "conf": round(conf_score, 3), "time_ms": round(infer_ms, 1)}
-
-# ================= Root =================
-@app.get("/")
-def root():
-    return {"message": "SmartWaste AI server is running"}
+    return {**info, "image": img_b64}
