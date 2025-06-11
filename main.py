@@ -17,6 +17,8 @@ from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, db as fdb
 
+
+
 # ─── Config ───────────────────────────────────────────
 ROOT        = Path(__file__).parent
 MODEL_PATH  = ROOT / "weights" / "best.pt"
@@ -30,10 +32,14 @@ MAPPING    = json.loads((ROOT / "mapping.json").read_text())  # name -> R/O/N
 GROUP_TXT  = {"R": "Tái chế", "O": "Hữu cơ", "N": "Không tái chế"}
 
 # ─── Firebase Init ───────────────────────────────────
-cred = credentials.Certificate(ROOT / "firebase_key.json")
+firebase_json_str = os.getenv("FIREBASE_KEY_JSON")
+firebase_dict = json.load(StringIO(firebase_json_str))
+
+cred = credentials.Certificate(firebase_dict)
 firebase_admin.initialize_app(
     cred, {"databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"}
 )
+
 
 def push_trigger(info: dict) -> None:
     fdb.reference("/waste").update({
