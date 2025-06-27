@@ -1,127 +1,159 @@
 """
-FastAPI YOLO + Firebase trigger
-  • POST /detect   : upload image
-  • GET  /snapshot : pull image from ESP32-CAM
-    → Sau mỗi infer ➜ /waste/ai = true và /waste/group = loại rác
+Smart Waste AI – FastAPI + YOLOv8
+Version: 2025-06-27
 """
-import os, time, cv2, json, logging, base64
-from datetime import datetime
+
+import os, json, logging
 from pathlib import Path
-from io import StringIO
+from uuid import uuid4
 
-import numpy as np, httpx
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool
+import cv2
+import numpy as np
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
-
 import firebase_admin
 from firebase_admin import credentials, db as fdb
 
-
-# ─── Config ───────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# 1. ĐƯỜNG DẪN & CẤU HÌNH
+# ────────────────────────────────────────────────────────────
 ROOT        = Path(__file__).parent
-MODEL_PATH  = ROOT / "weights" / "best.pt"
-ESP_CAM_URL = "http://192.168.118.187/capture"
-DEBUG_DIR   = ROOT / "snapshots"; DEBUG_DIR.mkdir(exist_ok=True)
-CONF_DEF    = 0.25
+MODEL_PATH  = ROOT / "weights" / os.getenv("MODEL_FILE", "best.pt")
 
-# ─── Class & Mapping ─────────────────────────────────
-CLASSES    = json.loads((ROOT / "classes.json").read_text())
-MAPPING    = json.loads((ROOT / "mapping.json").read_text())  # name -> R/O/N
-GROUP_TXT  = {"R": "Tái chế", "O": "Hữu cơ", "N": "Không tái chế"}
+TMP_DIR     = ROOT / "temp"   # lưu ảnh tạm (xóa sau khi xử lý)
+STATIC_DIR  = ROOT / "static" # cho file kết quả (last.jpg, last_boxed.jpg)
+TMP_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)
 
-# ─── Firebase Init ───────────────────────────────────
-firebase_json_str = os.getenv("FIREBASE_KEY_JSON")
-firebase_dict = json.load(StringIO(firebase_json_str))
+CONF_THRESH = float(os.getenv("CONF_THRESH", 0.25))
 
-cred = credentials.Certificate(firebase_dict)
-firebase_admin.initialize_app(
-    cred, {"databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"}
-)
+# ────────────────────────────────────────────────────────────
+# 2. LABELS & MAPPING
+# ────────────────────────────────────────────────────────────
+with open(ROOT / "classes.json", "r", encoding="utf-8") as f:
+    CLASSES = json.load(f)          # idx → label
 
+with open(ROOT / "mapping.json", "r", encoding="utf-8") as f:
+    MAPPING = json.load(f)          # label → O / R / N
 
-def push_trigger(info: dict) -> None:
-    fdb.reference("/waste").update({
-        "ai": True,
-        "group": info["group"]
-    })
+GROUP_TEXT = {"O": "Hữu cơ", "R": "Tái chế", "N": "Không tái chế"}
 
-# ─── Load YOLO model ─────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# 3. FIREBASE
+#    - Biến môi trường:
+#         FIREBASE_DB_URL       = https://<project>.firebaseio.com/
+#         FIREBASE_CRED_JSON    = nội dung service-account JSON (escaped 1 dòng)
+# ────────────────────────────────────────────────────────────
+cred_json = os.getenv("FIREBASE_CRED_JSON")
+if cred_json:                      # production
+    cred = credentials.Certificate(json.loads(cred_json))
+else:                              # local fallback
+    cred = credentials.Certificate(ROOT / "firebase_key.json")
+
+firebase_admin.initialize_app(cred, {
+    "databaseURL": os.getenv("FIREBASE_DB_URL",
+                             "https://datn-5b6dc-default-rtdb.firebaseio.com/")
+})
+ref_ai   = fdb.reference("/waste/ai")
+
+# ────────────────────────────────────────────────────────────
+# 4. YOLOv8 – load & fuse
+# ────────────────────────────────────────────────────────────
 model = YOLO(str(MODEL_PATH))
-if bool(int(os.getenv("FUSE", 1))):
-    model.fuse()
+model.fuse()
 
-# ─── FastAPI App ─────────────────────────────────────
-app = FastAPI(title="SmartWaste AI")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
+# ────────────────────────────────────────────────────────────
+# 5. FASTAPI
+# ────────────────────────────────────────────────────────────
+app = FastAPI(title="Smart Waste AI")
 log = logging.getLogger("uvicorn.error")
 
-# ─── Helpers ─────────────────────────────────────────
-def save_dbg(img: np.ndarray, tag: str) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    cv2.imwrite(str(DEBUG_DIR / f"{ts}_{tag}.jpg"), img)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-def infer(img: np.ndarray, conf: float = CONF_DEF):
-    res = model(img, conf=conf, verbose=False)[0]
-    if not len(res.boxes):
-        return res.plot(), None
 
-    b       = res.boxes[0]
-    idx     = int(b.cls[0])
-    label   = CLASSES[idx]
-    code    = MAPPING.get(label, "N")
-    group   = GROUP_TXT[code]
-    score   = float(b.conf[0])
-    info = {"label": label, "code": code, "group": group, "conf": score}
-    return res.plot(), info
+# ────────────────────────────────────────────────────────────
+# 6. UTILS
+# ────────────────────────────────────────────────────────────
+def sharpness_score(img: np.ndarray) -> float:
+    """Variance of Laplacian → càng cao càng nét."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-# ─── Endpoints ───────────────────────────────────────
-@app.post("/detect")
-async def detect(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    conf: float = CONF_DEF,
-):
-    raw = await file.read()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    vis, info = await run_in_threadpool(infer, img, conf)
-    if info is None:
+
+def classify(img: np.ndarray, box_path: Path | None = None) -> dict | None:
+    """Chạy YOLO, vẽ box nếu cần, trả về thông tin nhãn."""
+    result = model(img, conf=CONF_THRESH, verbose=False)[0]
+    if not result.boxes:
+        return None
+
+    box   = result.boxes[0]
+    label = CLASSES[int(box.cls[0])]
+    conf  = float(box.conf[0])
+    code  = MAPPING.get(label, "N")
+    group = GROUP_TEXT[code]
+
+    if box_path:
+        draw = img.copy()
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cv2.rectangle(draw, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(draw, f"{label} ({conf:.2f})", (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imwrite(str(box_path), draw)
+
+    return {"label": label, "conf": round(conf, 3), "code": code, "group": group}
+
+
+def push_to_firebase(info: dict) -> None:
+    """Cập nhật kết quả lên RTDB."""
+    ref_ai.update({"group": info["group"]})
+
+
+# ────────────────────────────────────────────────────────────
+# 7. ENDPOINTS
+# ────────────────────────────────────────────────────────────
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/upload")
+async def upload_img(req: Request):
+    """ESP32-CAM POST raw JPEG → lưu file tạm."""
+    data = await req.body()
+    fname = TMP_DIR / f"{uuid4().hex}.jpg"
+    with open(fname, "wb") as f:
+        f.write(data)
+    return {"status": "uploaded", "file": fname.name}
+
+
+@app.get("/detect")
+def detect_best():
+    """Chọn ảnh nét nhất trong temp/, phân loại, trả kết quả."""
+    imgs = list(TMP_DIR.glob("*.jpg"))
+    if not imgs:
+        return {"error": "no_images"}
+
+    best_path = max(imgs, key=lambda p: sharpness_score(cv2.imread(str(p))))
+    best_img  = cv2.imread(str(best_path))
+    best_score = sharpness_score(best_img)
+    log.info(f"Best image = {best_path.name} ({best_score:.2f})")
+
+    info = classify(best_img, box_path=STATIC_DIR / "last_boxed.jpg")
+    if not info:
         return {"error": "no_object"}
 
-    _, buffer = cv2.imencode(".jpg", vis)
-    img_b64 = base64.b64encode(buffer).decode()
+    # Lưu ảnh gốc & đẩy Firebase
+    cv2.imwrite(str(STATIC_DIR / "last.jpg"), best_img)
+    push_to_firebase(info)
 
-    # background_tasks.add_task(save_dbg, vis, "upload")
-    background_tasks.add_task(push_trigger, info)
+    # Dọn temp
+    for p in imgs: p.unlink(missing_ok=True)
 
-    return {**info, "image": img_b64}
-
-@app.get("/snapshot")
-async def snapshot(
-    background_tasks: BackgroundTasks,
-    conf: float = CONF_DEF,
-):
-    print("📸 snapshot endpoint triggered")
-    try:
-        async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(ESP_CAM_URL)
-            r.raise_for_status()
-    except httpx.RequestError as e:
-        log.error("🚫 ESP32-CAM unreachable: %s", e)
-        return {"error": "esp_cam_unreachable"}
-
-    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
-    vis, info = await run_in_threadpool(infer, img, conf)
-    if info is None:
-        return {"error": "no_object"}
-
-    _, buffer = cv2.imencode(".jpg", vis)
-    img_b64 = base64.b64encode(buffer).decode()
-
-    # background_tasks.add_task(save_dbg, vis, "snapshot")
-    background_tasks.add_task(push_trigger, info)
-
-    return {**info, "image": img_b64}
+    return {
+        "group": info["group"],
+        "label": info["label"],
+        "conf": info["conf"],
+        "sharpness": round(best_score, 2),
+        "image_with_box": "/static/last_boxed.jpg"
+    }
