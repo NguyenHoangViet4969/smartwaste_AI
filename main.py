@@ -1,5 +1,5 @@
 """
-Smart Waste AI – FastAPI + YOLOv8
+Smart Waste AI – FastAPI + YOLOv8/YOLOv11
 Version: 2025-06-27
 """
 
@@ -23,9 +23,11 @@ ROOT = Path(__file__).parent.resolve()
 
 MODEL_PATH = ROOT / "weights" / os.getenv("MODEL_FILE", "best.pt")
 CONF_THRESH = float(os.getenv("CONF_THRESH", 0.25))
+DEVICE = os.getenv("DEVICE", "cpu")
 
 TMP_DIR, STATIC_DIR = ROOT / "temp", ROOT / "static"
-TMP_DIR.mkdir(exist_ok=True), STATIC_DIR.mkdir(exist_ok=True)
+TMP_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)
 
 # ────────────────────────────────────────────────────────────
 # 2. LABELS & MAPPING
@@ -50,21 +52,23 @@ else:
 
 firebase_admin.initialize_app(
     cred,
-    {"databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"},
+    {"databaseURL": "https://datn-5b6dc-default-rtdb.firebaseio.com/"}
 )
 ref_ai = fdb.reference("/waste/ai")
 
 # ────────────────────────────────────────────────────────────
-# 4. KHỞI TẠO YOLOv8
+# 4. KHỞI TẠO YOLO
 # ────────────────────────────────────────────────────────────
 model = YOLO(str(MODEL_PATH))
 model.fuse()
+model.to(DEVICE)
+log = logging.getLogger("uvicorn.error")
+log.info(f"✅ YOLO is running on device: {model.device}")
 
 # ────────────────────────────────────────────────────────────
 # 5. FASTAPI APP
 # ────────────────────────────────────────────────────────────
 app = FastAPI(title="Smart Waste AI")
-log = logging.getLogger("uvicorn.error")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ────────────────────────────────────────────────────────────
@@ -101,9 +105,10 @@ def push_to_firebase(info: dict):
 # ────────────────────────────────────────────────────────────
 # 7. ENDPOINTS
 # ────────────────────────────────────────────────────────────
+
 @app.get("/")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "yolo_device": str(model.device)}
 
 @app.post("/upload")
 async def upload_img(req: Request):
@@ -119,69 +124,54 @@ async def upload_img(req: Request):
 
     return {"status": "uploaded", "file": fname.name}
 
-@app.get("/detect")
-def detect_best():
+@app.get("/detect/{filename}")
+def detect_file(filename: str):
     t0 = time.time()
 
-    imgs = list(TMP_DIR.glob("*.jpg"))
-    if not imgs:
-        return JSONResponse({"error": "no_images"})
+    img_path = TMP_DIR / filename
+    if not img_path.exists():
+        return JSONResponse({"error": "file_not_found"})
 
+    img = cv2.imread(str(img_path))
+    sharp = sharpness_score(img)
     t1 = time.time()
-    log.info(f"⏱️ List images: {t1 - t0:.3f}s")
+    log.info(f"⏱️ Load image: {t1 - t0:.3f}s")
 
-    scores = []
-    for p in imgs:
-        img = cv2.imread(str(p))
-        score = sharpness_score(img)
-        scores.append((p, score))
-
+    info = classify(img, box_path=STATIC_DIR / "last_boxed.jpg")
     t2 = time.time()
-    log.info(f"⏱️ Compute sharpness: {t2 - t1:.3f}s")
+    log.info(f"⏱️ YOLO classify: {t2 - t1:.3f}s")
 
-    best_path, best_score = max(scores, key=lambda x: x[1])
-    best_img = cv2.imread(str(best_path))
-
+    img_path.unlink(missing_ok=True)
     t3 = time.time()
-    log.info(f"⏱️ Load best image: {t3 - t2:.3f}s")
-
-    info = classify(best_img, box_path=STATIC_DIR / "last_boxed.jpg")
-    t4 = time.time()
-    log.info(f"⏱️ YOLO classify: {t4 - t3:.3f}s")
+    log.info(f"⏱️ Cleanup temp file: {t3 - t2:.3f}s")
 
     if not info:
         return JSONResponse({"error": "no_object"})
 
-    cv2.imwrite(str(STATIC_DIR / "last.jpg"), best_img)
-    t5 = time.time()
-    log.info(f"⏱️ Save last.jpg: {t5 - t4:.3f}s")
+    cv2.imwrite(str(STATIC_DIR / "last.jpg"), img)
+    t4 = time.time()
+    log.info(f"⏱️ Save last.jpg: {t4 - t3:.3f}s")
 
     push_to_firebase(info)
-    t6 = time.time()
-    log.info(f"⏱️ Firebase update: {t6 - t5:.3f}s")
+    t5 = time.time()
+    log.info(f"⏱️ Firebase update: {t5 - t4:.3f}s")
 
-    for p in imgs:
-        p.unlink(missing_ok=True)
-    t7 = time.time()
-    log.info(f"⏱️ Cleanup temp files: {t7 - t6:.3f}s")
-
-    total_time = t7 - t0
+    total_time = t5 - t0
     log.info(f"✅ Detect completed in {total_time:.3f}s")
 
     return JSONResponse({
         "group": info["group"],
         "label": info["label"],
         "conf": info["conf"],
-        "sharpness": round(best_score, 2),
+        "sharpness": round(sharp, 2),
         "image_with_box": "/static/last_boxed.jpg",
+        "yolo_device": str(model.device),
         "times": {
-            "list_images": round(t1 - t0, 3),
-            "sharpness": round(t2 - t1, 3),
-            "load_best": round(t3 - t2, 3),
-            "yolo": round(t4 - t3, 3),
-            "save": round(t5 - t4, 3),
-            "firebase": round(t6 - t5, 3),
-            "cleanup": round(t7 - t6, 3),
+            "load_image": round(t1 - t0, 3),
+            "yolo": round(t2 - t1, 3),
+            "cleanup": round(t3 - t2, 3),
+            "save": round(t4 - t3, 3),
+            "firebase": round(t5 - t4, 3),
             "total": round(total_time, 3),
         }
     })
