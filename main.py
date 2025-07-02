@@ -16,9 +16,9 @@ from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, db as fdb
 
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # 1. THƯ MỤC & CẤU HÌNH CHUNG
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 ROOT = Path(__file__).parent.resolve()
 
 MODEL_PATH = ROOT / "weights" / os.getenv("MODEL_FILE", "best.pt")
@@ -29,16 +29,16 @@ TMP_DIR, STATIC_DIR = ROOT / "temp", ROOT / "static"
 TMP_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
 
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # 2. LABELS & MAPPING
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 CLASSES = json.load(open(ROOT / "classes.json", encoding="utf-8"))
 MAPPING = json.load(open(ROOT / "mapping.json", encoding="utf-8"))
 GROUP_TEXT = {"O": "Hữu cơ", "R": "Tái chế", "N": "Không tái chế"}
 
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # 3. KẾT NỐI FIREBASE
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 cred_json = os.getenv("FIREBASE_CRED_JSON")
 if cred_json:
     cred = credentials.Certificate(json.loads(cred_json))
@@ -56,24 +56,24 @@ firebase_admin.initialize_app(
 )
 ref_ai = fdb.reference("/waste/ai")
 
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # 4. KHỞI TẠO YOLO
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 model = YOLO(str(MODEL_PATH))
 model.fuse()
 model.to(DEVICE)
 log = logging.getLogger("uvicorn.error")
 log.info(f"✅ YOLO is running on device: {model.device}")
 
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # 5. FASTAPI APP
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 app = FastAPI(title="Smart Waste AI")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # 6. HÀM TIỆN ÍCH
-# ────────────────────────────────────────────────────────────
+# ─────────────────────────────
 def sharpness_score(img: np.ndarray) -> float:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
@@ -86,7 +86,7 @@ def classify(img: np.ndarray, box_path: Path | None = None) -> dict | None:
     box = res.boxes[0]
     label = CLASSES[int(box.cls[0])]
     conf = float(box.conf[0])
-    code = MAPPING.get(label, "N")
+    code = MAPPING.get(label) or "N"  # Nếu None hoặc rỗng thì fallback
     group = GROUP_TEXT[code]
 
     if box_path:
@@ -101,14 +101,14 @@ def classify(img: np.ndarray, box_path: Path | None = None) -> dict | None:
 
 def push_to_firebase(info: dict):
     ref_ai.update({
-        "group": info["group"],
+        "group": info["code"],   # Lưu code R/O/N
         "label": info["label"],
         "confidence": info["conf"]
     })
-# ────────────────────────────────────────────────────────────
-# 7. ENDPOINTS
-# ────────────────────────────────────────────────────────────
 
+# ─────────────────────────────
+# 7. ENDPOINTS
+# ─────────────────────────────
 @app.get("/")
 def health():
     return {"status": "ok", "yolo_device": str(model.device)}
