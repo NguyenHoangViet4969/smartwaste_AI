@@ -101,7 +101,7 @@ def classify(img: np.ndarray, box_path: Path | None = None) -> dict | None:
 
 def push_to_firebase(info: dict):
     ref_ai.update({
-        "group": info["code"],
+        "group": info["group"],
         "label": info["label"],
         "confidence": info["conf"]
     })
