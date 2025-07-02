@@ -100,8 +100,11 @@ def classify(img: np.ndarray, box_path: Path | None = None) -> dict | None:
     return {"label": label, "conf": round(conf, 3), "code": code, "group": group}
 
 def push_to_firebase(info: dict):
-    ref_ai.update({"group": info["group"]})
-
+    ref_ai.update({
+        "group": info["code"],
+        "label": info["label"],
+        "confidence": info["conf"]
+    })
 # ────────────────────────────────────────────────────────────
 # 7. ENDPOINTS
 # ────────────────────────────────────────────────────────────
